@@ -1,5 +1,5 @@
 # =========================================================
-# ARIMA vs SLA-AWARE LSTM AUTOSCALER COMPARISON
+# LSTM SLA-AWARE AUTOSCALER vs ARIMA AUTOSCALER
 # =========================================================
 
 import numpy as np
@@ -10,30 +10,41 @@ import joblib
 from sklearn.metrics import classification_report, roc_auc_score
 from statsmodels.tsa.arima.model import ARIMA
 
-# =========================================================
-# LOAD MODEL + SCALER
-# =========================================================
+# ================================
+# REPRODUCIBILITY
+# ================================
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# ================================
+# LOAD MODEL & SCALER
+# ================================
 
 model = tf.keras.models.load_model("sla_lstm_autoscaler.keras")
 scaler = joblib.load("scaler.save")
 
-print("Models loaded.")
+print("Model and scaler loaded.")
 
-# =========================================================
+# ================================
 # CONFIG
-# =========================================================
+# ================================
 
 UPSCALE_THRESHOLD = 0.45
 DOWNSCALE_THRESHOLD = 0.35
-
 MAX_SCALE_UP = 40
 MIN_INSTANCES = 1
+VM_COST_PER_UNIT = 0.05
 
-VM_COST = 0.05
+SEQ_LEN = 30
+TEST_SAMPLES = 1000
 
-DATASET = "sla_violation_dataset_100k_moderate_noise.csv"
+DATASET_PATH = "sla_violation_dataset_100k_moderate_noise.csv"
+TARGET_COLUMN = "sla_violation_future"
 
-TARGET = "sla_violation_future"
+# ================================
+# FEATURES
+# ================================
 
 BASE_FEATURES = [
     "p95_latency_ms","p99_latency_ms","error_rate",
@@ -44,18 +55,18 @@ BASE_FEATURES = [
     "active_instances"
 ]
 
-# =========================================================
+# ================================
 # LOAD DATA
-# =========================================================
+# ================================
 
-df = pd.read_csv(DATASET)
+df = pd.read_csv(DATASET_PATH)
 df = df.sort_values("timestamp").reset_index(drop=True)
 
-ROLL = 5
+ROLL_WINDOW = 5
 
-df["p95_latency_roll_mean"] = df["p95_latency_ms"].rolling(ROLL).mean()
-df["cpu_roll_mean"] = df["cpu_utilization"].rolling(ROLL).mean()
-df["queue_roll_mean"] = df["queue_length"].rolling(ROLL).mean()
+df["p95_latency_roll_mean"] = df["p95_latency_ms"].rolling(ROLL_WINDOW).mean()
+df["cpu_roll_mean"] = df["cpu_utilization"].rolling(ROLL_WINDOW).mean()
+df["queue_roll_mean"] = df["queue_length"].rolling(ROLL_WINDOW).mean()
 
 df.fillna(0,inplace=True)
 
@@ -66,42 +77,55 @@ FEATURE_COLUMNS = BASE_FEATURES + [
 ]
 
 X_raw = df[FEATURE_COLUMNS]
-y_raw = df[TARGET]
+y_raw = df[TARGET_COLUMN]
 
 X_scaled = scaler.transform(X_raw)
 
-# =========================================================
+latency_series = df["p95_latency_ms"].values
+
+# ================================
 # BUILD SEQUENCES
-# =========================================================
+# ================================
 
 def build_sequences(X,y,seq_len):
 
-    Xs=[]
-    ys=[]
+    X_seq=[]
+    y_seq=[]
 
     for i in range(len(X)-seq_len):
-        Xs.append(X[i:i+seq_len])
-        ys.append(y.iloc[i+seq_len])
+        X_seq.append(X[i:i+seq_len])
+        y_seq.append(y.iloc[i+seq_len])
 
-    return np.array(Xs),np.array(ys)
+    return np.array(X_seq),np.array(y_seq)
 
-
-SEQ=30
-
-X_seq,y_seq = build_sequences(X_scaled,y_raw,SEQ)
+X_seq,y_seq = build_sequences(X_scaled,y_raw,SEQ_LEN)
 
 split = int(0.85*len(X_seq))
 
 X_test = X_seq[split:]
 y_test = y_seq[split:]
 
-# =========================================================
-# FUNCTION : PHYSICS SCALING
-# =========================================================
+print("Total sequences:",len(X_seq))
+print("Test sequences:",len(X_test))
 
-def apply_scaling_physics(seq,old,new,scaler,features):
+# ================================
+# CLASSIFIER PERFORMANCE
+# ================================
 
-    ratio = old/new
+y_prob = model.predict(X_test)
+y_pred = (y_prob>=0.5).astype(int)
+
+print("\nClassifier Performance")
+print(classification_report(y_test,y_pred))
+print("ROC-AUC:",roc_auc_score(y_test,y_prob))
+
+# ================================
+# PHYSICS SCALING
+# ================================
+
+def apply_scaling_physics(seq,old_inst,new_inst,scaler,feature_cols):
+
+    ratio = old_inst/new_inst
 
     affected = [
         "queue_length",
@@ -112,160 +136,164 @@ def apply_scaling_physics(seq,old,new,scaler,features):
         "p99_latency_ms"
     ]
 
-    for f in affected:
+    for name in affected:
 
-        idx = features.index(f)
+        idx = feature_cols.index(name)
 
         minv = scaler.data_min_[idx]
         maxv = scaler.data_max_[idx]
 
-        real = seq[-1,idx]*(maxv-minv)+minv
+        real_val = seq[-1,idx]*(maxv-minv)+minv
+        real_val *= ratio
 
-        real *= ratio
-
-        scaled = (real-minv)/(maxv-minv)
-
-        seq[-1,idx] = scaled
+        scaled_val = (real_val-minv)/(maxv-minv)
+        seq[-1,idx] = scaled_val
 
     return seq
 
-
 # =========================================================
-# 1️⃣ LSTM SLA AUTOSCALER
+# LSTM CONTROLLER EVALUATION
 # =========================================================
-
-def lstm_controller(seq):
-
-    seq = seq.copy()
-
-    idx = FEATURE_COLUMNS.index("active_instances")
-
-    minv = scaler.data_min_[idx]
-    maxv = scaler.data_max_[idx]
-
-    inst = seq[-1,idx]*(maxv-minv)+minv
-    inst = int(round(inst))
-
-    while True:
-
-        prob = model.predict(seq[np.newaxis,:,:],verbose=0)[0][0]
-
-        if prob < UPSCALE_THRESHOLD:
-            break
-
-        new_inst = inst+2
-
-        seq = apply_scaling_physics(seq,inst,new_inst,scaler,FEATURE_COLUMNS)
-
-        scaled = (new_inst-minv)/(maxv-minv)
-
-        seq[-1,idx] = scaled
-
-        inst = new_inst
-
-        if inst>60:
-            break
-
-    return inst
-
-
-# =========================================================
-# 2️⃣ ARIMA AUTOSCALER
-# =========================================================
-
-def arima_controller(history,current_instances):
-
-    try:
-
-        model = ARIMA(history,order=(2,1,2))
-        fit = model.fit()
-
-        forecast = fit.forecast()[0]
-
-    except:
-        forecast = history[-1]
-
-    # simple threshold rule
-
-    if forecast > 350:
-        current_instances += 2
-
-    elif forecast < 200 and current_instances>1:
-        current_instances -= 1
-
-    return current_instances
-
-
-# =========================================================
-# COMPARISON LOOP
-# =========================================================
-
-print("\nRunning comparison...")
 
 baseline_violations = 0
-lstm_violations = 0
-arima_violations = 0
+post_scaling_violations = 0
 
-baseline_cost = 0
-lstm_cost = 0
-arima_cost = 0
+baseline_total_cost = 0
+post_scaling_total_cost = 0
 
-latency_series = df["p95_latency_ms"].values
+print("\n=== LSTM CONTROLLER EVALUATION ===")
 
-for i,seq in enumerate(X_test[:200]):
+for seq in X_test[:TEST_SAMPLES]:
 
-    seq0 = seq.copy()
+    seq_original = seq.copy()
 
-    # original instances
+    initial_prob = model.predict(
+        seq_original[np.newaxis,:,:],verbose=0
+    )[0][0]
 
     idx = FEATURE_COLUMNS.index("active_instances")
 
-    minv = scaler.data_min_[idx]
-    maxv = scaler.data_max_[idx]
+    inst_min = scaler.data_min_[idx]
+    inst_max = scaler.data_max_[idx]
 
-    inst = seq0[-1,idx]*(maxv-minv)+minv
-    inst = int(round(inst))
+    scaled_val = seq_original[-1,idx]
 
-    # baseline
+    original_inst = int(round(
+        scaled_val*(inst_max-inst_min)+inst_min
+    ))
 
-    prob = model.predict(seq0[np.newaxis,:,:],verbose=0)[0][0]
-
-    if prob >= UPSCALE_THRESHOLD:
+    if initial_prob >= UPSCALE_THRESHOLD:
         baseline_violations += 1
 
-    baseline_cost += inst*VM_COST
+    baseline_total_cost += original_inst*VM_COST_PER_UNIT
 
-    # LSTM controller
+    seq_test = seq_original.copy()
+    current_inst = original_inst
 
-    new_inst_lstm = lstm_controller(seq0.copy())
+    if initial_prob >= UPSCALE_THRESHOLD:
 
-    seq_lstm = apply_scaling_physics(seq0.copy(),inst,new_inst_lstm,scaler,FEATURE_COLUMNS)
+        while True:
 
-    prob_lstm = model.predict(seq_lstm[np.newaxis,:,:],verbose=0)[0][0]
+            prob = model.predict(
+                seq_test[np.newaxis,:,:],verbose=0
+            )[0][0]
 
-    if prob_lstm >= UPSCALE_THRESHOLD:
-        lstm_violations += 1
+            if prob < UPSCALE_THRESHOLD:
+                break
 
-    lstm_cost += new_inst_lstm*VM_COST
+            step = 2
+            new_inst = current_inst + step
 
-    # ARIMA controller
+            seq_test = apply_scaling_physics(
+                seq_test,current_inst,new_inst,
+                scaler,FEATURE_COLUMNS
+            )
 
-    history = latency_series[i:i+SEQ]
+            scaled_new = (new_inst-inst_min)/(inst_max-inst_min)
+            seq_test[-1,idx] = scaled_new
 
-    new_inst_arima = arima_controller(history,inst)
+            current_inst = new_inst
 
-    seq_arima = apply_scaling_physics(seq0.copy(),inst,new_inst_arima,scaler,FEATURE_COLUMNS)
+            if current_inst > original_inst + MAX_SCALE_UP:
+                break
 
-    prob_arima = model.predict(seq_arima[np.newaxis,:,:],verbose=0)[0][0]
+    final_prob = model.predict(
+        seq_test[np.newaxis,:,:],verbose=0
+    )[0][0]
 
-    if prob_arima >= UPSCALE_THRESHOLD:
-        arima_violations += 1
+    if final_prob >= UPSCALE_THRESHOLD:
+        post_scaling_violations += 1
 
-    arima_cost += new_inst_arima*VM_COST
-
+    post_scaling_total_cost += current_inst*VM_COST_PER_UNIT
 
 # =========================================================
-# RESULTS
+# ARIMA CONTROLLER EVALUATION
+# =========================================================
+
+arima_violations = 0
+arima_total_cost = 0
+
+print("\n=== ARIMA CONTROLLER EVALUATION ===")
+
+for i,seq in enumerate(X_test[:TEST_SAMPLES]):
+
+    seq_original = seq.copy()
+
+    idx = FEATURE_COLUMNS.index("active_instances")
+
+    inst_min = scaler.data_min_[idx]
+    inst_max = scaler.data_max_[idx]
+
+    scaled_val = seq_original[-1,idx]
+
+    original_inst = int(round(
+        scaled_val*(inst_max-inst_min)+inst_min
+    ))
+
+    seq_test = seq_original.copy()
+    current_inst = original_inst
+
+    latency_history = latency_series[i:i+SEQ_LEN]
+
+    try:
+        arima_model = ARIMA(latency_history,order=(1,1,1))
+        fit = arima_model.fit()
+        forecast_latency = fit.forecast()[0]
+    except:
+        forecast_latency = latency_history[-1]
+
+    TARGET_LATENCY = 250
+
+    while forecast_latency > TARGET_LATENCY:
+
+        new_inst = current_inst + 2
+
+        seq_test = apply_scaling_physics(
+            seq_test,current_inst,new_inst,
+            scaler,FEATURE_COLUMNS
+        )
+
+        scaled_new = (new_inst-inst_min)/(inst_max-inst_min)
+        seq_test[-1,idx] = scaled_new
+
+        current_inst = new_inst
+
+        forecast_latency = forecast_latency*(original_inst/current_inst)
+
+        if current_inst > original_inst + MAX_SCALE_UP:
+            break
+
+    final_prob = model.predict(
+        seq_test[np.newaxis,:,:],verbose=0
+    )[0][0]
+
+    if final_prob >= UPSCALE_THRESHOLD:
+        arima_violations += 1
+
+    arima_total_cost += current_inst*VM_COST_PER_UNIT
+
+# =========================================================
+# FINAL RESULTS
 # =========================================================
 
 print("\n==============================")
@@ -273,15 +301,17 @@ print("AUTOSCALER COMPARISON RESULTS")
 print("==============================")
 
 print("\nBaseline Violations:",baseline_violations)
-print("LSTM SLA Violations:",lstm_violations)
+print("LSTM Violations:",post_scaling_violations)
 print("ARIMA Violations:",arima_violations)
 
-print("\nBaseline Cost:",round(baseline_cost,2))
-print("LSTM Cost:",round(lstm_cost,2))
-print("ARIMA Cost:",round(arima_cost,2))
+print("\nBaseline Cost:",round(baseline_total_cost,2))
+print("LSTM Cost:",round(post_scaling_total_cost,2))
+print("ARIMA Cost:",round(arima_total_cost,2))
 
-print("\nViolation Reduction (LSTM):",
-      round((baseline_violations-lstm_violations)/baseline_violations*100,2),"%")
+print("\nViolation Reduction LSTM:",
+      round((baseline_violations-post_scaling_violations)
+/baseline_violations*100,2),"%")
 
-print("Violation Reduction (ARIMA):",
-      round((baseline_violations-arima_violations)/baseline_violations*100,2),"%")
+print("Violation Reduction ARIMA:",
+      round((baseline_violations-arima_violations)
+/baseline_violations*100,2),"%")

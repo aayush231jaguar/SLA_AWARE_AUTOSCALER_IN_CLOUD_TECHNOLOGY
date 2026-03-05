@@ -281,7 +281,7 @@ post_scaling_total_cost = 0
 
 print("\n=== SYSTEM LEVEL EVALUATION ===")
 
-for seq in X_test[:100]:
+for seq in X_test[:1000]:
 
     seq_original = seq.copy()
 
