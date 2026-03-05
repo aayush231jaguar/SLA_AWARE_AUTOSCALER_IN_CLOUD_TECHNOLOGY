@@ -1,18 +1,31 @@
+# =========================================================
+# CONTROLLER + EVALUATION SCRIPT
+# =========================================================
+
 import numpy as np
 import pandas as pd
+import tensorflow as tf
+import joblib
 
-from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import classification_report, roc_auc_score
 
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
+# ================================
+# LOAD MODEL & SCALER
+# ================================
+model = tf.keras.models.load_model("sla_lstm_autoscaler.keras")
+scaler = joblib.load("scaler.save")
 
+print("Model and scaler loaded.")
 
 # ================================
-# 1. Load Dataset
+# CONFIG
 # ================================
+UPSCALE_THRESHOLD = 0.45
+DOWNSCALE_THRESHOLD = 0.35
+MAX_SCALE_UP = 40
+MIN_INSTANCES = 1
+VM_COST_PER_UNIT = 0.05
+
 DATASET_PATH = "sla_violation_dataset_100k_moderate_noise.csv"
 TARGET_COLUMN = "sla_violation_future"
 
@@ -25,19 +38,16 @@ BASE_FEATURES = [
     "active_instances"
 ]
 
+# ================================
+# LOAD DATA
+# ================================
 df = pd.read_csv(DATASET_PATH)
 df = df.sort_values("timestamp").reset_index(drop=True)
 
-
-# ================================
-# 2. Rolling Features
-# ================================
 ROLL_WINDOW = 5
-
 df["p95_latency_roll_mean"] = df["p95_latency_ms"].rolling(ROLL_WINDOW).mean()
 df["cpu_roll_mean"] = df["cpu_utilization"].rolling(ROLL_WINDOW).mean()
 df["queue_roll_mean"] = df["queue_length"].rolling(ROLL_WINDOW).mean()
-
 df.fillna(0, inplace=True)
 
 FEATURE_COLUMNS = BASE_FEATURES + [
@@ -49,16 +59,10 @@ FEATURE_COLUMNS = BASE_FEATURES + [
 X_raw = df[FEATURE_COLUMNS]
 y_raw = df[TARGET_COLUMN]
 
+X_scaled = scaler.transform(X_raw)
 
 # ================================
-# 3. Scaling
-# ================================
-scaler = MinMaxScaler()
-X_scaled = scaler.fit_transform(X_raw)
-
-
-# ================================
-# 4. Sequence Builder
+# SEQUENCES
 # ================================
 def build_sequences(X, y, seq_len):
     X_seq, y_seq = [], []
@@ -70,48 +74,11 @@ def build_sequences(X, y, seq_len):
 SEQ_LEN = 30
 X_seq, y_seq = build_sequences(X_scaled, y_raw, SEQ_LEN)
 
-
-# ================================
-# 5. Split Data
-# ================================
-train_end = int(0.7 * len(X_seq))
 val_end = int(0.85 * len(X_seq))
-
-X_train, y_train = X_seq[:train_end], y_seq[:train_end]
-X_val, y_val = X_seq[train_end:val_end], y_seq[train_end:val_end]
 X_test, y_test = X_seq[val_end:], y_seq[val_end:]
 
-
 # ================================
-# 6. LSTM Model
-# ================================
-model = Sequential([
-    LSTM(64, return_sequences=True,
-         input_shape=(SEQ_LEN, X_train.shape[2])),
-    Dropout(0.2),
-    LSTM(32),
-    Dropout(0.2),
-    Dense(1, activation="sigmoid")
-])
-
-model.compile(
-    optimizer="adam",
-    loss="binary_crossentropy",
-    metrics=["accuracy"]
-)
-
-model.fit(
-    X_train, y_train,
-    validation_data=(X_val, y_val),
-    epochs=10,
-    batch_size=64,
-    callbacks=[EarlyStopping(patience=5, restore_best_weights=True)],
-    verbose=1
-)
-
-
-# ================================
-# 7. Evaluation
+# CLASSIFIER EVALUATION
 # ================================
 y_prob = model.predict(X_test)
 y_pred = (y_prob >= 0.5).astype(int)
@@ -119,6 +86,8 @@ y_pred = (y_prob >= 0.5).astype(int)
 print("\nClassifier Performance")
 print(classification_report(y_test, y_pred))
 print("ROC-AUC:", roc_auc_score(y_test, y_prob))
+
+print("\nController evaluation can be added here (Section 12 logic).")
 
 
 # ================================
@@ -302,7 +271,7 @@ for i, seq in enumerate(X_test[:20]):
 # 12. Performance Evaluation Metrics
 # ================================
 
-VM_COST_PER_UNIT = 0.05   # assume cost per VM per timestep (can change)
+VM_COST_PER_UNIT = 0.05
 
 baseline_violations = 0
 post_scaling_violations = 0
@@ -312,47 +281,45 @@ post_scaling_total_cost = 0
 
 print("\n=== SYSTEM LEVEL EVALUATION ===")
 
-for seq in X_test[:100]:   # evaluate on 100 sequences
+for seq in X_test[:100]:
 
     seq_original = seq.copy()
 
-    # Get initial probability
     initial_prob = model.predict(
         seq_original[np.newaxis, :, :],
         verbose=0
     )[0][0]
 
-    # Get original VM count
     idx = FEATURE_COLUMNS.index("active_instances")
     inst_min = scaler.data_min_[idx]
     inst_max = scaler.data_max_[idx]
 
     scaled_val = seq_original[-1, idx]
-    original_inst = scaled_val * (inst_max - inst_min) + inst_min
-    original_inst = int(round(original_inst))
+    original_inst = int(round(
+        scaled_val * (inst_max - inst_min) + inst_min
+    ))
 
-    # Baseline metrics
-    if initial_prob >= 0.4:
+    # Baseline
+    if initial_prob >= UPSCALE_THRESHOLD:
         baseline_violations += 1
 
     baseline_total_cost += original_inst * VM_COST_PER_UNIT
 
-    # ------------------------------
-    # Apply Intelligent Controller
-    # ------------------------------
-
+    # Apply controller
     seq_test = seq_original.copy()
     current_inst = original_inst
 
-    if initial_prob >= 0.4:
-        # Upscale
+    # ---------- UPSCALE ----------
+    if initial_prob >= UPSCALE_THRESHOLD:
+
         while True:
+
             prob = model.predict(
                 seq_test[np.newaxis, :, :],
                 verbose=0
             )[0][0]
 
-            if prob < 0.4:
+            if prob < UPSCALE_THRESHOLD:
                 break
 
             step = 2
@@ -371,22 +338,23 @@ for seq in X_test[:100]:   # evaluate on 100 sequences
 
             current_inst = new_inst
 
-            if current_inst > original_inst + 40:
+            if current_inst > original_inst + MAX_SCALE_UP:
                 break
 
+    # ---------- DOWNSCALE ----------
     else:
-        # Downscale
-        while current_inst > 1:
+
+        while current_inst > MIN_INSTANCES:
+
             prob = model.predict(
                 seq_test[np.newaxis, :, :],
                 verbose=0
             )[0][0]
 
-            if prob >= 0.4:
+            if prob >= DOWNSCALE_THRESHOLD:
                 break
 
-            step = 1
-            new_inst = max(1, current_inst - step)
+            new_inst = current_inst - 1
 
             test_seq = apply_scaling_physics(
                 seq_test.copy(),
@@ -404,24 +372,21 @@ for seq in X_test[:100]:   # evaluate on 100 sequences
                 verbose=0
             )[0][0]
 
-            if prob_test >= 0.4:
+            if prob_test >= DOWNSCALE_THRESHOLD:
                 break
 
             seq_test = test_seq
             current_inst = new_inst
 
-    # Post-scaling probability
     final_prob = model.predict(
         seq_test[np.newaxis, :, :],
         verbose=0
     )[0][0]
 
-    if final_prob >= 0.4:
+    if final_prob >= UPSCALE_THRESHOLD:
         post_scaling_violations += 1
 
     post_scaling_total_cost += current_inst * VM_COST_PER_UNIT
-
-
 # ================================
 # 13. Final Metrics
 # ================================
