@@ -26,7 +26,7 @@ MAX_SCALE_UP = 40
 MIN_INSTANCES = 1
 VM_COST_PER_UNIT = 0.05
 
-DATASET_PATH = "sla_violation_dataset_100k_moderate_noise.csv"
+DATASET_PATH = "random_dataset_fixed_100k.csv"
 TARGET_COLUMN = "sla_violation_future"
 
 BASE_FEATURES = [

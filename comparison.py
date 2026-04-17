@@ -34,12 +34,11 @@ UPSCALE_THRESHOLD = 0.45
 DOWNSCALE_THRESHOLD = 0.35
 MAX_SCALE_UP = 40
 MIN_INSTANCES = 1
-VM_COST_PER_UNIT = 0.05
 
 SEQ_LEN = 30
 TEST_SAMPLES = 1000
 
-DATASET_PATH = "sla_violation_dataset_100k_moderate_noise.csv"
+DATASET_PATH = "random_dataset_fixed_100k.csv"
 TARGET_COLUMN = "sla_violation_future"
 
 # ================================
@@ -151,6 +150,29 @@ def apply_scaling_physics(seq,old_inst,new_inst,scaler,feature_cols):
 
     return seq
 
+
+# =========================================================
+# METRIC STORAGE
+# =========================================================
+
+baseline_cpu=[]
+baseline_ram=[]
+
+lstm_cpu=[]
+lstm_ram=[]
+
+arima_cpu=[]
+arima_ram=[]
+
+baseline_latency=[]
+lstm_latency=[]
+arima_latency=[]
+
+baseline_vms = []
+lstm_vms = []
+arima_vms = []
+
+
 # =========================================================
 # LSTM CONTROLLER EVALUATION
 # =========================================================
@@ -181,11 +203,19 @@ for seq in X_test[:TEST_SAMPLES]:
     original_inst = int(round(
         scaled_val*(inst_max-inst_min)+inst_min
     ))
+    baseline_vms.append(original_inst)
+
+    cpu_idx = FEATURE_COLUMNS.index("cpu_utilization")
+    ram_idx = FEATURE_COLUMNS.index("memory_utilization")
+    lat_idx = FEATURE_COLUMNS.index("p95_latency_ms")
+
+    baseline_cpu.append(seq_original[-1,cpu_idx])
+    baseline_ram.append(seq_original[-1,ram_idx])
+    baseline_latency.append(seq_original[-1,lat_idx])
 
     if initial_prob >= UPSCALE_THRESHOLD:
         baseline_violations += 1
 
-    baseline_total_cost += original_inst*VM_COST_PER_UNIT
 
     seq_test = seq_original.copy()
     current_inst = original_inst
@@ -224,10 +254,15 @@ for seq in X_test[:TEST_SAMPLES]:
     if final_prob >= UPSCALE_THRESHOLD:
         post_scaling_violations += 1
 
-    post_scaling_total_cost += current_inst*VM_COST_PER_UNIT
+
+    lstm_cpu.append(seq_test[-1,cpu_idx])
+    lstm_ram.append(seq_test[-1,ram_idx])
+    lstm_latency.append(seq_test[-1,lat_idx])
+    lstm_vms.append(current_inst)
+
 
 # =========================================================
-# ARIMA CONTROLLER EVALUATION
+# ARIMA CONTROLLER
 # =========================================================
 
 arima_violations = 0
@@ -290,7 +325,16 @@ for i,seq in enumerate(X_test[:TEST_SAMPLES]):
     if final_prob >= UPSCALE_THRESHOLD:
         arima_violations += 1
 
-    arima_total_cost += current_inst*VM_COST_PER_UNIT
+
+    cpu_idx = FEATURE_COLUMNS.index("cpu_utilization")
+    ram_idx = FEATURE_COLUMNS.index("memory_utilization")
+    lat_idx = FEATURE_COLUMNS.index("p95_latency_ms")
+
+    arima_cpu.append(seq_test[-1,cpu_idx])
+    arima_ram.append(seq_test[-1,ram_idx])
+    arima_latency.append(seq_test[-1,lat_idx])
+    arima_vms.append(current_inst)
+
 
 # =========================================================
 # FINAL RESULTS
@@ -309,9 +353,149 @@ print("LSTM Cost:",round(post_scaling_total_cost,2))
 print("ARIMA Cost:",round(arima_total_cost,2))
 
 print("\nViolation Reduction LSTM:",
-      round((baseline_violations-post_scaling_violations)
+round((baseline_violations-post_scaling_violations)
 /baseline_violations*100,2),"%")
 
 print("Violation Reduction ARIMA:",
-      round((baseline_violations-arima_violations)
+round((baseline_violations-arima_violations)
 /baseline_violations*100,2),"%")
+
+# =========================================================
+# SLA COMPLIANCE RATE (NEW METRIC)
+# =========================================================
+
+total_requests = TEST_SAMPLES
+
+baseline_compliance = (total_requests - baseline_violations) / total_requests * 100
+lstm_compliance = (total_requests - post_scaling_violations) / total_requests * 100
+arima_compliance = (total_requests - arima_violations) / total_requests * 100
+
+print("\n==============================")
+print("SLA COMPLIANCE RATE")
+print("==============================")
+
+print("Baseline:",round(baseline_compliance,2),"%")
+print("LSTM:",round(lstm_compliance,2),"%")
+print("ARIMA:",round(arima_compliance,2),"%")
+
+
+# =========================================================
+# FINAL COMPARISON TABLE
+# =========================================================
+
+print("\n==============================")
+print("FINAL PERFORMANCE COMPARISON")
+print("==============================")
+
+baseline_vm_avg = np.mean(baseline_vms)
+lstm_vm_avg = np.mean(lstm_vms)
+arima_vm_avg = np.mean(arima_vms)
+
+baseline_cpu_avg = np.mean(baseline_cpu)*100
+lstm_cpu_avg = np.mean(lstm_cpu)*100
+arima_cpu_avg = np.mean(arima_cpu)*100
+
+baseline_ram_avg = np.mean(baseline_ram)*100
+lstm_ram_avg = np.mean(lstm_ram)*100
+arima_ram_avg = np.mean(arima_ram)*100
+
+baseline_lat_avg = np.mean(baseline_latency)
+lstm_lat_avg = np.mean(lstm_latency)
+arima_lat_avg = np.mean(arima_latency)
+
+print("\nModel Comparison:")
+print("--------------------------------------------------------------")
+print("Model      Violations   SLA%   CPU%   RAM%   Latency(ms)   Avg VMs")
+print("--------------------------------------------------------------")
+
+print(f"Baseline   {baseline_violations:<12} {baseline_compliance:.2f}   {baseline_cpu_avg:.2f}   {baseline_ram_avg:.2f}   {baseline_lat_avg:.2f}   {baseline_vm_avg:.2f}")
+print(f"LSTM       {post_scaling_violations:<12} {lstm_compliance:.2f}   {lstm_cpu_avg:.2f}   {lstm_ram_avg:.2f}   {lstm_lat_avg:.2f}   {lstm_vm_avg:.2f}")
+print(f"ARIMA      {arima_violations:<12} {arima_compliance:.2f}   {arima_cpu_avg:.2f}   {arima_ram_avg:.2f}   {arima_lat_avg:.2f}   {arima_vm_avg:.2f}")
+
+print("--------------------------------------------------------------")
+
+
+import matplotlib.pyplot as plt
+
+models = ["Baseline","LSTM","ARIMA"]
+
+violations = [
+baseline_violations,
+post_scaling_violations,
+arima_violations
+]
+
+sla = [
+baseline_compliance,
+lstm_compliance,
+arima_compliance
+]
+
+costs = [
+baseline_total_cost,
+post_scaling_total_cost,
+arima_total_cost
+]
+
+cpu = [
+baseline_cpu_avg,
+lstm_cpu_avg,
+arima_cpu_avg
+]
+
+latency = [
+baseline_lat_avg,
+lstm_lat_avg,
+arima_lat_avg
+]
+
+# ================================
+# SLA Compliance Chart
+# ================================
+
+plt.figure()
+plt.bar(models,sla)
+plt.title("SLA Compliance Comparison")
+plt.ylabel("SLA Compliance (%)")
+plt.show()
+
+# ================================
+# SLA Violations Chart
+# ================================
+
+plt.figure()
+plt.bar(models,violations)
+plt.title("SLA Violations Comparison")
+plt.ylabel("Number of Violations")
+plt.show()
+
+# VM Usage Comparison
+plt.figure()
+plt.bar(models,[
+    baseline_vm_avg,
+    lstm_vm_avg,
+    arima_vm_avg
+])
+plt.title("Average VM Usage")
+plt.ylabel("Active Instances")
+plt.show()
+
+# ================================
+# CPU Utilization
+# ================================
+
+plt.figure()
+plt.bar(models,cpu)
+plt.title("Average CPU Utilization")
+plt.ylabel("CPU Utilization (%)")
+plt.show()
+
+# ================================
+# Latency Comparison
+# ================================
+
+plt.figure()
+plt.bar(models,latency)
+plt.title("Average P95 Latency")
+plt.ylabel("Latency (ms)")
+plt.show()

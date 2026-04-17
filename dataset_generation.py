@@ -11,60 +11,80 @@ timestamps = pd.date_range(
     freq="min"
 )
 
-# ============================
-# Base Metrics (Moderate Noise)
-# ============================
-p95_latency_ms = np.random.normal(300, 90, N)
-p99_latency_ms = p95_latency_ms + np.random.normal(70, 30, N)
+# ======================================
+# PERIODIC LOAD (FIXED - IMPORTANT)
+# ======================================
+t = np.arange(N)
 
-error_rate = np.clip(np.random.beta(2, 25, N), 0, 0.25)
-queue_length = np.clip(np.random.poisson(10, N), 0, 45)
-queue_wait_time_ms = np.random.normal(80, 30, N)
+# Full sinusoidal range → ensures SLA crossing
+load = 0.5 + 0.5 * np.sin(2 * np.pi * t / 500)
 
-cpu_utilization = np.random.normal(60, 15, N)
-memory_utilization = np.random.normal(65, 12, N)
-active_instances = np.random.randint(2, 7, N)
+# Add moderate noise
+load += np.random.normal(0, 0.05, N)
 
-# ============================
-# Derived Temporal Features
-# ============================
+# Keep in valid bounds
+load = np.clip(load, 0, 1)
+
+# ======================================
+# METRICS GENERATED FROM LOAD
+# ======================================
+
+p95_latency_ms = 200 + load * 600 + np.random.normal(0, 40, N)
+p99_latency_ms = p95_latency_ms + np.random.normal(60, 25, N)
+
+error_rate = 0.01 + load * 0.12 + np.random.normal(0, 0.01, N)
+error_rate = np.clip(error_rate, 0, 0.25)
+
+queue_length = load * 45 + np.random.normal(0, 3, N)
+queue_length = np.clip(queue_length, 0, 50)
+
+queue_wait_time_ms = load * 250 + np.random.normal(0, 30, N)
+queue_wait_time_ms = np.clip(queue_wait_time_ms, 0, 400)
+
+cpu_utilization = 40 + load * 60 + np.random.normal(0, 5, N)
+cpu_utilization = np.clip(cpu_utilization, 5, 100)
+
+memory_utilization = 50 + load * 45 + np.random.normal(0, 5, N)
+memory_utilization = np.clip(memory_utilization, 10, 100)
+
+active_instances = (2 + load * 6).astype(int)
+active_instances = np.clip(active_instances, 1, 10)
+
+# ======================================
+# TEMPORAL FEATURES
+# ======================================
+
 delta_p95_latency = np.diff(p95_latency_ms, prepend=p95_latency_ms[0])
 delta_queue_length = np.diff(queue_length, prepend=queue_length[0])
 
-latency_slope = np.gradient(p95_latency_ms) + np.random.normal(0, 3, N)
-error_rate_slope = np.gradient(error_rate) + np.random.normal(0, 0.005, N)
+latency_slope = np.gradient(p95_latency_ms)
+error_rate_slope = np.gradient(error_rate)
 
-# ============================
-# Risk Score (Stronger Signal)
-# ============================
-risk_score = (
-    0.40 * (p95_latency_ms / 500) +
-    0.25 * (p99_latency_ms / 700) +
-    0.15 * (error_rate / 0.20) +
-    0.10 * (queue_length / 40) +
-    0.10 * (cpu_utilization / 100)
-)
+# ======================================
+# HARD SLA CONDITIONS (CRITICAL)
+# ======================================
 
-# Reduced noise (KEY CHANGE)
-risk_score += np.random.normal(0, 0.07, N)
+sla_violation_future = (
+    (p95_latency_ms > 500) |
+    (p99_latency_ms > 700) |
+    (error_rate > 0.10) |
+    (queue_length > 35) |
+    (cpu_utilization > 85)
+).astype(int)
 
-# Narrower probabilistic threshold
-thresholds = np.random.uniform(0.45, 0.65, N)
+# ======================================
+# DATAFRAME
+# ======================================
 
-sla_violation_future = (risk_score > thresholds).astype(int)
-
-# ============================
-# Assemble Dataset
-# ============================
 df = pd.DataFrame({
     "timestamp": timestamps,
     "p95_latency_ms": np.clip(p95_latency_ms, 50, 1200),
     "p99_latency_ms": np.clip(p99_latency_ms, 80, 1600),
     "error_rate": error_rate,
     "queue_length": queue_length,
-    "queue_wait_time_ms": np.clip(queue_wait_time_ms, 0, 400),
-    "cpu_utilization": np.clip(cpu_utilization, 5, 100),
-    "memory_utilization": np.clip(memory_utilization, 10, 100),
+    "queue_wait_time_ms": queue_wait_time_ms,
+    "cpu_utilization": cpu_utilization,
+    "memory_utilization": memory_utilization,
     "delta_p95_latency": delta_p95_latency,
     "delta_queue_length": delta_queue_length,
     "latency_slope": latency_slope,
@@ -73,7 +93,17 @@ df = pd.DataFrame({
     "sla_violation_future": sla_violation_future
 })
 
-df.to_csv("sla_violation_dataset_100k_moderate_noise.csv", index=False)
+# ======================================
+# SAVE
+# ======================================
 
-print("Dataset generated.")
+df.to_csv("sla_periodic_100k.csv", index=False)
+
+# ======================================
+# DEBUG OUTPUT
+# ======================================
+
+print("Dataset generated successfully.")
+print("\nViolation Distribution:")
+print(df["sla_violation_future"].value_counts())
 print(df["sla_violation_future"].value_counts(normalize=True))

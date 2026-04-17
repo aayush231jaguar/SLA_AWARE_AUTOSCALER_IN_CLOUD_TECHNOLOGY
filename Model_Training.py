@@ -33,7 +33,7 @@ MIN_INSTANCES = 1
 # ================================
 # 1. Load Dataset
 # ================================
-DATASET_PATH = "sla_violation_dataset_100k_moderate_noise.csv"
+DATASET_PATH = "sla_dataset_burst_100k.csv"
 TARGET_COLUMN = "sla_violation_future"
 
 BASE_FEATURES = [
